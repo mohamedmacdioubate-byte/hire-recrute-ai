@@ -12,6 +12,7 @@
   <link rel="apple-touch-icon" href="/icon-192.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
 :root{--ink:#1c2330;--paper:#f6f3ec;--paper2:#eee9dc;--line:#d8d2c0;--amber:#c8762a;--amberD:#9c5a1e;--green:#3f6b4f;--red:#a8432f;--muted:#6b6657;}
 *{box-sizing:border-box;margin:0;padding:0;}
@@ -407,7 +408,8 @@ var founderCfg    = DB.get('founderCfg',{
   aiProviders:{
     anthropic:{key:'',model:'claude-sonnet-4-6'},
     openai:{key:'',model:'gpt-4o-mini'}
-  }
+  },
+  aiPlans:{starter:false,pro:true,premium:true}
 });
 // Migration : ancien format (une seule clé Anthropic) vers le nouveau format multi-fournisseurs
 if(!founderCfg.aiProviders){
@@ -417,6 +419,10 @@ if(!founderCfg.aiProviders){
   };
   founderCfg.aiProvider='anthropic';
   delete founderCfg.anthropicKey;
+}
+// Migration : activation IA par forfait (nouveau champ)
+if(!founderCfg.aiPlans){
+  founderCfg.aiPlans={starter:false,pro:true,premium:true};
 }
 var nextOfferId = DB.get('nextOfferId',1);
 
@@ -429,6 +435,15 @@ function saveAll(){
   DB.set('founderCfg',founderCfg);
   DB.set('nextOfferId',nextOfferId);
 }
+
+// ============================================================
+// BASE DE DONNÉES PARTAGÉE (Supabase)
+// ============================================================
+// Project URL et clé anon public — sûres à exposer côté client, la sécurité
+// réelle est assurée par les règles RLS définies dans supabase-schema.sql.
+var SUPABASE_URL = 'https://nnrldxmemgijycylnpok.supabase.co';
+var SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5ucmxkeG1lbWdpanljeWxucG9rIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ3MTIyMTIsImV4cCI6MjEwMDI4ODIxMn0.riXfurDP1-OPSI18q_t4fZdhRsz_-P6knEcqR4F0-PU';
+var sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // ============================================================
 // ÉTAT
@@ -486,6 +501,18 @@ function getAICfg(provider){
 
 function aiProviderLabel(p){
   return {anthropic:'Anthropic (Claude)', openai:'OpenAI (GPT)'}[p] || p;
+}
+
+// Vérifie si le fondateur a activé l'IA pour un forfait donné (starter/pro/premium)
+function isAIEnabledForPlan(plan){
+  return !!(founderCfg.aiPlans && founderCfg.aiPlans[plan]);
+}
+
+// Génère une ligne de fonctionnalité IA (✦ activé / — désactivé) pour le tableau des forfaits
+function aiFeatLi(enabled,label){
+  return enabled
+    ? '<li><span class="ai-i">✦</span> '+label+' <span class="ai-badge">IA</span></li>'
+    : '<li><span class="no">—</span> '+label+'</li>';
 }
 
 // Appel générique au proxy IA (fonction serverless Vercel : /api/ai.js) — fonctionne
@@ -555,18 +582,59 @@ function handleAuth(){
   var email=G('emailIn').value.trim().toLowerCase();
   var pass=G('passIn').value;
   var name=G('nameIn').value.trim();
-  var errEl=G('authErr');errEl.style.display='none';
+  var errEl=G('authErr');errEl.style.display='none';errEl.style.color='';
   if(!email||!pass){errEl.textContent='Remplissez tous les champs.';errEl.style.display='block';return;}
   if(pass.length<6){errEl.textContent='Mot de passe minimum 6 caractères.';errEl.style.display='block';return;}
+  var btn=G('authSubmit');var oldTxt=btn.textContent;btn.disabled=true;btn.textContent='Patientez...';
+
   if(authMode==='signup'){
-    if(accounts.find(function(a){return a.email===email;})){errEl.textContent='Cet email est déjà utilisé.';errEl.style.display='block';return;}
-    if(!name){errEl.textContent='Entrez votre nom.';errEl.style.display='block';return;}
-    var acc={email:email,pass:pass,role:authRole,name:name,createdAt:new Date().toISOString()};
-    accounts.push(acc);saveAll();loginAs(acc);
+    if(!name){errEl.textContent='Entrez votre nom.';errEl.style.display='block';btn.disabled=false;btn.textContent=oldTxt;return;}
+    sb.auth.signUp({
+      email:email,
+      password:pass,
+      options:{data:{name:name,role:authRole}}
+    }).then(function(res){
+      btn.disabled=false;btn.textContent=oldTxt;
+      if(res.error){
+        errEl.textContent=(res.error.message==='User already registered')?'Cet email est déjà utilisé.':res.error.message;
+        errEl.style.display='block';return;
+      }
+      if(!res.data.session){
+        // La confirmation par email est activée sur le projet Supabase :
+        // pas de session immédiate tant que le lien reçu par email n'est pas cliqué.
+        errEl.style.color='var(--green)';
+        errEl.textContent='Compte créé ! Vérifiez votre email pour confirmer votre compte, puis connectez-vous.';
+        errEl.style.display='block';
+        return;
+      }
+      var acc={email:email,name:name,role:authRole,createdAt:new Date().toISOString(),contact:null};
+      accounts.push(acc);saveAll();
+      loginAs(acc);
+    }).catch(function(err){
+      btn.disabled=false;btn.textContent=oldTxt;
+      errEl.textContent='Erreur : '+err.message;errEl.style.display='block';
+    });
   }else{
-    var acc=accounts.find(function(a){return a.email===email&&a.pass===pass;});
-    if(!acc){errEl.textContent='Email ou mot de passe incorrect.';errEl.style.display='block';return;}
-    loginAs(acc);
+    sb.auth.signInWithPassword({email:email,password:pass}).then(function(res){
+      if(res.error){
+        btn.disabled=false;btn.textContent=oldTxt;
+        errEl.textContent='Email ou mot de passe incorrect.';errEl.style.display='block';return;
+      }
+      sb.from('profiles').select('*').eq('id',res.data.user.id).single().then(function(profRes){
+        btn.disabled=false;btn.textContent=oldTxt;
+        if(profRes.error||!profRes.data){errEl.textContent='Erreur de profil : '+(profRes.error?profRes.error.message:'introuvable');errEl.style.display='block';return;}
+        var p=profRes.data;
+        var acc={email:p.email,name:p.name,role:p.role,createdAt:p.created_at,contact:p.contact||null};
+        var existing=accounts.find(function(a){return a.email===acc.email;});
+        if(existing){existing.name=acc.name;existing.role=acc.role;existing.contact=acc.contact;}
+        else accounts.push(acc);
+        saveAll();
+        loginAs(acc);
+      });
+    }).catch(function(err){
+      btn.disabled=false;btn.textContent=oldTxt;
+      errEl.textContent='Erreur : '+err.message;errEl.style.display='block';
+    });
   }
 }
 function loginAs(acc){
@@ -579,10 +647,32 @@ function loginAs(acc){
   }else{show('pageApp');renderCandLayout();}
 }
 function logoutUser(){
+  sb.auth.signOut();
   currentUser=null;authRole=null;
   hide('pageApp');hide('pagePayment');show('pageAuth');
   hide('authFormStep');show('authRoleStep');
   G('founderTrigger').style.display='block';
+}
+
+// Reconnexion automatique si une session Supabase valide existe déjà
+// (permet de rester connecté après un rechargement de page, et même
+// de se reconnecter automatiquement depuis un autre appareil si la
+// session y a été ouverte).
+function restoreSession(){
+  sb.auth.getSession().then(function(res){
+    var session=res.data&&res.data.session;
+    if(!session)return;
+    sb.from('profiles').select('*').eq('id',session.user.id).single().then(function(profRes){
+      if(profRes.error||!profRes.data)return;
+      var p=profRes.data;
+      var acc={email:p.email,name:p.name,role:p.role,createdAt:p.created_at,contact:p.contact||null};
+      var existing=accounts.find(function(a){return a.email===acc.email;});
+      if(existing){existing.name=acc.name;existing.role=acc.role;existing.contact=acc.contact;}
+      else accounts.push(acc);
+      saveAll();
+      loginAs(acc);
+    });
+  });
 }
 
 // ============================================================
@@ -604,9 +694,9 @@ function renderPaymentPage(){
   html+='<li><span class="ok">✓</span> 3 offres actives</li>';
   html+='<li><span class="ok">✓</span> 50 CV / mois</li>';
   html+='<li><span class="ok">✓</span> Classement automatique</li>';
-  html+='<li><span class="no">—</span> Suggestions IA</li>';
+  html+=aiFeatLi(founderCfg.aiPlans.starter,'Suggestions IA');
   html+='<li><span class="no">—</span> Analyse CV IA</li>';
-  html+='<li><span class="no">—</span> Chatbot</li>';
+  html+=aiFeatLi(founderCfg.aiPlans.starter,'Chatbot');
   html+='</ul>';
   html+='<button class="pay-btn green-btn" onclick="handlePayment(\'starter\')"'+(cfg.stripeLinks.starter?'':' disabled')+'>'+( cfg.stripeLinks.starter?"Commencer l'essai gratuit":'Bientôt disponible')+'</button>';
   html+='</div>';
@@ -622,9 +712,9 @@ function renderPaymentPage(){
   html+='<li><span class="ok">✓</span> 10 offres actives</li>';
   html+='<li><span class="ok">✓</span> 200 CV / mois</li>';
   html+='<li><span class="ok">✓</span> Classement automatique</li>';
-  html+='<li><span class="ai-i">✦</span> Suggestions IA <span class="ai-badge">IA</span></li>';
+  html+=aiFeatLi(founderCfg.aiPlans.pro,'Suggestions IA');
   html+='<li><span class="ai-i">✦</span> Analyse CV IA <span class="ai-badge">IA</span></li>';
-  html+='<li><span class="no">—</span> Chatbot</li>';
+  html+=aiFeatLi(founderCfg.aiPlans.pro,'Chatbot');
   html+='</ul>';
   html+='<button class="pay-btn green-btn" onclick="handlePayment(\'pro\')"'+(cfg.stripeLinks.pro?'':' disabled')+'>'+( cfg.stripeLinks.pro?"Commencer l'essai gratuit":'Bientôt disponible')+'</button>';
   html+='</div>';
@@ -639,9 +729,9 @@ function renderPaymentPage(){
   html+='<li><span class="ok">✓</span> Offres illimitées</li>';
   html+='<li><span class="ok">✓</span> CV illimités</li>';
   html+='<li><span class="ok">✓</span> Classement automatique</li>';
-  html+='<li><span class="ai-i">✦</span> Suggestions IA <span class="ai-badge">IA</span></li>';
+  html+=aiFeatLi(founderCfg.aiPlans.premium,'Suggestions IA');
   html+='<li><span class="ai-i">✦</span> Analyse + résumé CV <span class="ai-badge">IA</span></li>';
-  html+='<li><span class="ai-i">✦</span> Chatbot intégré <span class="ai-badge">IA</span></li>';
+  html+=aiFeatLi(founderCfg.aiPlans.premium,'Chatbot intégré');
   html+='<li><span class="ok">✓</span> Contact fondateur direct</li>';
   html+='</ul>';
   html+='<button class="pay-btn amber-btn" onclick="handlePayment(\'premium\')">Contacter le fondateur</button>';
@@ -729,7 +819,7 @@ function renderEntLayout(){
     var lbl=founderCfg.contact.type==='whatsapp'?'Ouvrir WhatsApp →':'Envoyer un email →';
     contactBox='<div class="sb-contact-box" style="margin-bottom:10px;"><div class="lbl">Contacter le fondateur</div><div class="val">'+esc(founderCfg.contact.value)+'</div><a href="'+href+'" target="_blank">'+lbl+'</a></div>';
   }
-  var chatBox=isPremium?'<div class="sb-chat" onclick="openChat()" style="margin-bottom:10px;"><div class="cbl">Assistant IA</div><div class="cbt">Chatbot HIRE RECRUT-AI</div><div class="cbh">Cliquez pour de l\'aide</div></div>':'';
+  var chatBox=isAIEnabledForPlan(plan)?'<div class="sb-chat" onclick="openChat()" style="margin-bottom:10px;"><div class="cbl">Assistant IA</div><div class="cbt">Chatbot HIRE RECRUT-AI</div><div class="cbh">Cliquez pour de l\'aide</div></div>':'';
   var planBox='<div class="sb-plan-box"><div class="lbl">Abonnement</div><div class="pname">'+planLabel(plan)+(trial?' (Essai)':'')+'</div><button onclick="entView(\'abos\')">'+(trial?'Activer mon abonnement':'Gérer')+'</button></div>';
   buildSidebar(currentUser.name,
     '<div class="sb-nav" id="snEOff" onclick="entView(\'offers\')">📋 Mes offres</div><div class="sb-nav" id="snEAbo" onclick="entView(\'abos\')">💳 Abonnement</div>',
@@ -873,17 +963,21 @@ function addCandidateToOffer(){
 
 function renderNewOffer(){
   newOfferKws=[{word:'',pts:1}];
+  var sub=getSub(currentUser.email);
+  var plan=sub?sub.plan:'starter';
   var html='<a class="back-link" onclick="entView(\'offers\')">← Retour aux offres</a>';
   html+='<h1 class="page-title">Nouvelle offre d\'emploi</h1>';
   html+='<p class="page-sub">Définissez le poste et votre grille de notation personnalisée.</p>';
   html+='<div class="panel" style="max-width:540px;">';
   html+='<div class="field" style="margin-bottom:16px;"><label style="font-size:12px;font-weight:600;display:block;margin-bottom:5px;">Intitulé du poste</label><input type="text" id="newOfferTitle" class="inp" placeholder="Ex: Responsable Comptable..."></div>';
+  if(isAIEnabledForPlan(plan)){
   html+='<div style="background:#faf1e3;border:1.5px solid var(--amber);border-radius:7px;padding:14px 16px;margin-bottom:16px;">';
   html+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;"><span style="font-size:13px;font-weight:700;color:var(--amberD);">✦ Suggestions IA de mots-clés</span><span style="font-family:JetBrains Mono,monospace;font-size:9px;background:var(--amber);color:var(--ink);padding:2px 6px;border-radius:3px;font-weight:700;">IA</span></div>';
   html+='<p style="font-size:12px;color:var(--muted);margin-bottom:10px;">Tapez le nom du poste puis cliquez — l IA génère les meilleurs mots-clés automatiquement.</p>';
   html+='<button class="btn amber" id="btnSuggest" onclick="suggestKeywords()" style="width:100%;padding:11px;">✦ Générer des suggestions IA</button>';
   html+='<div id="suggestResult" style="margin-top:10px;display:none;"></div>';
   html+='</div>';
+  }
   html+='<div class="field"><label style="font-size:12px;font-weight:600;display:block;margin-bottom:8px;">Mots-clés et points</label><p style="font-size:12px;color:var(--muted);margin-bottom:12px;">Chaque occurrence du mot-clé dans un CV rapporte les points définis.</p><div id="kwListDiv"></div><button class="btn ghost small" style="margin-top:4px;" onclick="addKwRow()">＋ Ajouter un critère</button></div>';
   html+='<button class="btn full" style="margin-top:16px;" onclick="createOffer()">Créer l\'offre</button>';
   html+='</div>';
@@ -1049,9 +1143,16 @@ function updCctLbl(){
 function saveCandContact(){
   var t=document.querySelector('input[name="cct"]:checked').value;
   var v=G('cctIn').value.trim();if(!v){alert('Entrez une valeur.');return;}
+  var contact={type:t,value:v};
   var acc=accounts.find(function(a){return a.email===currentUser.email;});
-  if(acc)acc.contact={type:t,value:v};
-  saveAll();G('cctOk').style.display='block';setTimeout(function(){G('cctOk').style.display='none';},3000);
+  if(acc)acc.contact=contact;
+  saveAll();
+  sb.auth.getUser().then(function(res){
+    var uid=res.data&&res.data.user&&res.data.user.id;
+    if(!uid)return;
+    sb.from('profiles').update({contact:contact}).eq('id',uid);
+  });
+  G('cctOk').style.display='block';setTimeout(function(){G('cctOk').style.display='none';},3000);
 }
 
 // ============================================================
@@ -1318,6 +1419,18 @@ function renderFndSettings(){
   html+='</select></div>';
   html+='<div id="aiProviderPanel"></div>';
   html+='</div>';
+  html+='<div class="panel" style="max-width:480px;margin-bottom:20px;">';
+  html+='<h3 style="font-family:\'Fraunces\',serif;font-size:16px;margin-bottom:6px;">🔌 Activation de l\'IA par forfait</h3>';
+  html+='<p style="font-size:13px;color:var(--muted);margin-bottom:14px;">Choisissez quels forfaits ont accès aux fonctionnalités IA (suggestions de mots-clés + chatbot). Si désactivée pour un forfait, l\'IA disparaît complètement de l\'interface pour les entreprises sur ce forfait.</p>';
+  ['starter','pro','premium'].forEach(function(p){
+    var checked=founderCfg.aiPlans[p]?' checked':'';
+    html+='<div style="display:flex;align-items:center;justify-content:space-between;padding:9px 0;border-bottom:1px solid #eee;">';
+    html+='<span style="font-size:13.5px;font-weight:600;">'+planLabel(p)+'</span>';
+    html+='<label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12.5px;color:var(--muted);">';
+    html+='<input type="checkbox" id="aiPlan_'+p+'" '+checked+' onchange="toggleAIPlan(\''+p+'\',this.checked)"> IA activée';
+    html+='</label></div>';
+  });
+  html+='</div>';
   html+='<div class="panel" style="max-width:480px;">';
   html+='<h3 style="font-family:\'Fraunces\',serif;font-size:16px;margin-bottom:10px;">Données de la plateforme</h3>';
   html+='<p style="font-size:13px;color:var(--muted);margin-bottom:14px;">Comptes: <b>'+accounts.length+'</b> · Offres: <b>'+offersDB.length+'</b> · Candidatures: <b>'+appsDB.length+'</b> · Abonnements: <b>'+subscriptions.length+'</b> · Paiements Premium: <b>'+premPayments.length+'</b></p>';
@@ -1343,6 +1456,11 @@ var AI_KEY_HELP={
 function switchAIProvider(p){
   founderCfg.aiProvider=p;saveAll();
   renderAIProviderPanel();
+}
+
+function toggleAIPlan(plan,enabled){
+  founderCfg.aiPlans[plan]=enabled;
+  saveAll();
 }
 
 function renderAIProviderPanel(){
@@ -1667,6 +1785,9 @@ function testApiKey(){
     errEl.textContent='❌ Erreur réseau : '+err.message;errEl.style.display='block';
   });
 }
+
+// Vérifie s'il existe déjà une session ouverte (reconnexion automatique)
+restoreSession();
 
 </script>
 
